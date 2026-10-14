@@ -11,6 +11,7 @@ import argparse
 from collections import deque
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,7 +24,7 @@ import urllib.parse
 import urllib.request
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 OK = 0
 WARNING = 1
 UNKNOWN = 3
@@ -33,7 +34,7 @@ DEFAULT_STATE = Path("/var/lib/nagios4/certspotter/state.json")
 TOKEN_KEY = "CERTSPOTTER_API_TOKEN"
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_OUTPUT_CHARS = 8_000
-STATE_VERSION = 1
+STATE_VERSION = 2
 DOMAIN_RE = re.compile(
     r"(?=^.{1,253}\.?$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.?$"
@@ -62,6 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Maximum full-domain API queries per check (default: 8)",
     )
+    parser.add_argument("--poll-interval", type=float, default=21600,
+                        help="Minimum seconds between API polling attempts (default: 21600)")
+    parser.add_argument("--warning-duration", type=float, default=3600,
+                        help="Seconds to display an issuance WARNING (default: 3600)")
+    parser.add_argument("--initialize", action="store_true",
+                        help="Explicitly allow a new state/domain baseline; never resets existing cursors")
+    parser.add_argument("--show-events", action="store_true",
+                        help="Print complete retained events as JSON without contacting the API")
     return parser
 
 
@@ -103,20 +112,26 @@ def load_token(path: Path) -> str:
 def new_state(domains: list[str]) -> dict[str, object]:
     return {
         "version": STATE_VERSION,
+        "events": [],
+        "last_attempt": None,
+        "last_success": None,
+        "errors": [],
         "domains": {
             domain: {"cursor": None, "initialized": False} for domain in domains
         },
     }
 
 
-def load_state(path: Path, domains: list[str]) -> dict[str, object]:
+def load_state(path: Path, domains: list[str], initialize: bool = False) -> dict[str, object]:
     if not path.exists():
+        if not initialize:
+            raise CheckError("state is missing; restore a backup or explicitly use --initialize")
         return new_state(domains)
     try:
         state = json.loads(path.read_text(encoding="utf-8", errors="strict"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise CheckError(f"cannot read state {path}: {exc}") from exc
-    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
+    if not isinstance(state, dict) or state.get("version") not in (1, STATE_VERSION):
         raise CheckError(f"unsupported or malformed state in {path}")
     domain_states = state.get("domains")
     if not isinstance(domain_states, dict):
@@ -131,7 +146,34 @@ def load_state(path: Path, domains: list[str]) -> dict[str, object]:
         if not isinstance(initialized, bool):
             raise CheckError(f"malformed initialization flag for {domain} in {path}")
     for domain in domains:
+        if domain not in domain_states and not initialize:
+            raise CheckError(f"no cursor state for {domain}; use --initialize to add its baseline")
         domain_states.setdefault(domain, {"cursor": None, "initialized": False})
+    if state["version"] == 1:
+        state.update(version=STATE_VERSION, events=[], last_attempt=None,
+                     last_success=None, errors=[])
+    for field in ("last_attempt", "last_success"):
+        stamp = state.get(field)
+        if stamp is not None and (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                                  or not math.isfinite(stamp) or stamp < 0):
+            raise CheckError(f"malformed {field} in state")
+    if not isinstance(state.get("errors"), list) or not all(isinstance(e, str) for e in state["errors"]):
+        raise CheckError("malformed cached errors in state")
+    events = state.get("events")
+    if not isinstance(events, list):
+        raise CheckError("malformed event history in state")
+    for event in events:
+        if (not isinstance(event, dict) or not isinstance(event.get("domain"), str)
+                or not isinstance(event.get("issuance"), dict)
+                or not isinstance(event["issuance"].get("id"), str)):
+            raise CheckError("malformed event in state")
+        for field in ("detected_at", "announced_at"):
+            stamp = event.get(field)
+            if stamp is None and field == "announced_at":
+                continue
+            if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                    or not math.isfinite(stamp) or stamp < 0):
+                raise CheckError("malformed event timestamp in state")
     return state
 
 
@@ -147,6 +189,11 @@ def save_state(path: Path, state: dict[str, object]) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -233,6 +280,7 @@ def poll(
         if remaining <= 0.5:
             errors.append("overall 55s deadline reached")
             break
+        queries += 1
         try:
             page = fetch(
                 domain,
@@ -244,15 +292,21 @@ def poll(
             errors.append(f"{domain}: {exc}")
             failed.add(domain)
             continue
-        queries += 1
         if not page:
             value["initialized"] = True
+            continue
+        if page[-1]["id"] == cursor:
+            errors.append(f"{domain}: API returned a non-advancing cursor")
+            failed.add(domain)
             continue
         value["cursor"] = page[-1]["id"]
         if initialized:
             findings.extend((domain, issuance) for issuance in page)
         queue.append(domain)
 
+    if queue:
+        errors.append("pagination incomplete: " + ", ".join(queue) +
+                      "; remaining pages will resume at the next API poll")
     return findings, errors, queries
 
 
@@ -317,7 +371,7 @@ def format_result(
         for detail in details:
             candidate = output + "\n" + detail
             if len(candidate) > MAX_OUTPUT_CHARS:
-                output += "\nAdditional issuance details were truncated."
+                output += "\nAdditional issuance details were truncated; full events are retained in state (--show-events)."
                 break
             output = candidate
         return WARNING, output
@@ -333,17 +387,53 @@ def format_result(
     return OK, f"CertSpotter OK: no new issuances for {len(domains)} domains"
 
 
+def evaluate(domains, state, token, args, now=None, fetch=fetch_page):
+    """Commit cursors and full events together; cache only changes presentation."""
+    now = time.time() if now is None else now
+    last = state.get("last_attempt")
+    if last is not None and now < last:
+        raise CheckError("clock moved backwards relative to the last API attempt")
+    due = last is None or now - last >= args.poll_interval
+    queries = 0
+    if due:
+        state["last_attempt"] = now
+        findings, errors, queries = poll(domains, state, token, args.timeout,
+                                         args.max_queries, fetch)
+        state["errors"] = errors
+        if not errors and all(state["domains"][d]["initialized"] for d in domains):
+            state["last_success"] = now
+        known = {(e["domain"], e["issuance"]["id"]) for e in state["events"]}
+        for domain, issuance in findings:
+            identity = (domain, issuance["id"])
+            if identity not in known:
+                state["events"].append(dict(domain=domain, issuance=issuance,
+                                            detected_at=now, announced_at=None))
+                known.add(identity)
+    active = [e for e in state["events"] if e["domain"] in domains and
+              (e["announced_at"] is None or now - e["announced_at"] < args.warning_duration)]
+    findings = [(e["domain"], e["issuance"]) for e in active]
+    code, output = format_result(domains, state, findings, state["errors"], queries)
+    def stamp(value):
+        return "never" if value is None else time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(value))
+    output += (f"\nAPI {'polled' if due else 'cached'}; last attempt: {stamp(state.get('last_attempt'))}; "
+               f"last complete successful poll: {stamp(state.get('last_success'))}; "
+               f"retained events: {len(state['events'])}")
+    return code, output, active
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        if args.timeout <= 0 or args.timeout > 30:
-            raise CheckError("timeout must be greater than 0 and at most 30 seconds")
+        if not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 30:
+            raise CheckError("timeout must be finite, greater than 0 and at most 30 seconds")
+        for name in ("poll_interval", "warning_duration"):
+            if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+                raise CheckError(f"{name.replace('_', '-')} must be finite and positive")
         if args.max_queries < 1 or args.max_queries > 8:
             raise CheckError("max-queries must be between 1 and 8")
         domains = normalize_domains(args.domain)
         if args.max_queries < len(domains):
             raise CheckError("max-queries must be at least the number of domains")
-        token = load_token(args.config)
         args.state_file.parent.mkdir(parents=True, exist_ok=True)
         lock_path = args.state_file.with_suffix(args.state_file.suffix + ".lock")
         with lock_path.open("a", encoding="utf-8") as lock:
@@ -352,17 +442,29 @@ def main() -> int:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise CheckError("another Cert Spotter check is still running") from exc
-            state = load_state(args.state_file, domains)
-            findings, errors, queries = poll(
-                domains, state, token, args.timeout, args.max_queries
-            )
+            state = load_state(args.state_file, domains, args.initialize)
+            if args.show_events:
+                print(json.dumps(state["events"], indent=2), flush=True)
+                return OK
+            token = load_token(args.config)
+            checked_at = time.time()
+            code, output, active = evaluate(domains, state, token, args, now=checked_at)
+            # Event bodies and new cursors reach durable storage before delivery.
             save_state(args.state_file, state)
-        status, output = format_result(domains, state, findings, errors, queries)
-    except (CheckError, OSError) as exc:
-        print(f"CertSpotter UNKNOWN: {clean(exc)}")
+            print(output, flush=True)
+            # Only acknowledge local output after it has been flushed. A crash
+            # before this commit replays the event, rather than losing it.
+            pending = [event for event in active if event["announced_at"] is None]
+            if pending:
+                for event in pending:
+                    event["announced_at"] = checked_at
+                save_state(args.state_file, state)
+            return code
+    except BrokenPipeError:
         return UNKNOWN
-    print(output)
-    return status
+    except (CheckError, OSError) as exc:
+        print(f"CertSpotter UNKNOWN: {clean(exc)}", flush=True)
+        return UNKNOWN
 
 
 if __name__ == "__main__":

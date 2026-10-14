@@ -11,7 +11,7 @@ by SSLMate or Nagios Enterprises.
 ## What it monitors
 
 The plugin stores the last opaque API cursor for each configured domain. The
-first run builds a baseline and intentionally returns OK, so existing historical
+first explicitly initialized run builds a baseline, so existing historical
 certificates do not generate alerts. Later issuances return WARNING and include
 the issuer, DNS names and validity period in Nagios long output.
 
@@ -61,7 +61,7 @@ Verify the check as the monitoring user:
 ```bash
 sudo -u nagios /usr/lib/nagios/plugins/check_certspotter.py \
   --domain example.com \
-  --domain example.net
+  --domain example.net --initialize
 ```
 
 The defaults are:
@@ -69,10 +69,15 @@ The defaults are:
 - token file: `/etc/nagios4/private/certspotter.env`
 - state file: `/var/lib/nagios4/certspotter/state.json`
 - request timeout: 12 seconds
-- query budget: 8 API requests per execution
+- query budget: 8 attempted API requests per polling execution
+- API polling interval: 21600 seconds (6 hours)
+- issuance WARNING duration: 3600 seconds (1 hour)
 
-Use `--config`, `--state-file`, `--timeout` and `--max-queries` to override
-them. The query budget must be at least the number of configured domains.
+Use `--config`, `--state-file`, `--timeout`, `--max-queries`, `--poll-interval`
+and `--warning-duration` to override them. Time values are in seconds and must
+be finite and positive. The query budget must be at least the number of configured
+domains. There is no new token-file setting: the timing options are command-line
+arguments, making separate monitoring commands straightforward.
 
 ## Nagios configuration
 
@@ -83,13 +88,27 @@ domains in one serialized execution:
 ```nagios
 define command {
     command_name    check_certspotter
-    command_line    $USER1$/check_certspotter.py --domain example.com --domain example.net
+    command_line    $USER1$/check_certspotter.py --domain example.com --domain example.net --poll-interval 21600 --warning-duration 3600
 }
 ```
 
-Run it hourly. For immediate event notifications, use a volatile service with
-one check attempt and WARNING notifications. UNKNOWN is reserved for API,
-configuration and state errors.
+Run the local check hourly. It only contacts the API when at least six hours have
+elapsed since the last attempt; other runs use the saved result. An issuance
+WARNING expires at the first local check at or after its configured duration.
+Scheduling delays can delay that transition. API errors do not expire to OK,
+and failed API attempts also wait for the polling interval before retrying.
+
+Use a **nonvolatile** service (`is_volatile 0`), one check attempt,
+`notification_interval 0`, and WARNING notifications. Cached warnings must not
+send repeated notifications. Keep the warning duration shorter than the polling
+interval and schedule checks frequently enough to observe the recovery to OK
+before the next poll. Returning OK means the event display has expired, not that
+anyone has approved the certificate.
+
+UNKNOWN is reserved for API, configuration, state errors and unfinished pagination.
+If new events and API errors occur together, the initial WARNING includes both;
+after the event expires, the unresolved error remains UNKNOWN. If API failures
+must also notify, include `u` in your service's `notification_options`.
 
 Before reloading Nagios, always run its configuration preflight command for your
 installation.
@@ -98,8 +117,8 @@ installation.
 
 | Code | State | Meaning |
 | ---: | --- | --- |
-| 0 | OK | Baseline is being built, or no new issuance was found |
-| 1 | WARNING | One or more new issuances were found |
+| 0 | OK | Complete baseline or no active issuance warning |
+| 1 | WARNING | One or more new/pending issuances, or an unexpired cached event warning |
 | 3 | UNKNOWN | The API, configuration, state or local runtime failed |
 
 The first output line is short Nagios status text. Each issuance is emitted on
@@ -110,13 +129,69 @@ feeds.
 
 ## State and recovery
 
-The plugin uses a non-blocking lock to prevent overlapping executions and writes
-state atomically with mode `0600`. Back up the state if uninterrupted detection
-is important.
+The plugin uses a non-blocking lock to prevent overlapping executions. State is
+written atomically with mode `0600`, with both the file and its parent directory
+synced to disk. Cursors and complete event bodies are committed together before
+printing a result. Pending output is acknowledged only after stdout is flushed.
+An interruption before acknowledgement replays the warning rather than silently
+skipping it. This guarantees local retention/replay, not successful Nagios
+notification or email delivery: those remain outside the plugin's control.
 
-Deleting the state file is safe, but the next run starts a fresh baseline and
-will not alert on certificates already present at that time. A malformed state
-file returns UNKNOWN instead of silently discarding the cursor.
+State version 2 stores:
+
+- `domains`: an opaque cursor and initialization flag per domain.
+- `last_attempt`, `last_success`: API-attempt time and last fully successful poll.
+- `errors`: cached errors that remain visible until a successful poll clears them.
+- `events`: full issuance objects with domain, detection time and local output
+  acknowledgement time. Events remain available after their WARNING expires.
+
+Existing version 1 state migrates automatically and keeps its cursors. Back up
+state before upgrading; version 1.0.0 cannot read version 2 state. To roll back,
+restore the old state backup with the old plugin. Events discovered after that
+backup may be replayed on a subsequent poll.
+
+A missing state file or a new domain without state returns UNKNOWN. Restore a
+backup to preserve continuity, or run `--initialize` explicitly to build a new
+baseline. Do not put `--initialize` in the recurring monitoring command. It does
+not reset existing cursors, but permits initialization of absent state/domains.
+Baseline pages are deliberately not treated as new events, including issuances
+that arrive while a multi-run baseline is still being built. Incomplete baseline
+pagination is UNKNOWN and resumes on the next scheduled API poll.
+
+After each page, the last issuance ID is used as `after` for the next request.
+This follows discovery order, including late-discovered older certificates.
+Budget/deadline exhaustion is reported and the next poll resumes at the saved
+cursor. No cursor is advanced for a failed page. API errors count against the
+query budget. The fixed overall polling deadline is 55 seconds.
+
+Complete event history is retained **without automatic deletion** in the state
+file, even when Nagios output is truncated. Include these files in backups and
+monitor storage growth on high-volume domains. Display the history without an
+API request or access to the token file:
+
+```bash
+sudo -u nagios /usr/lib/nagios/plugins/check_certspotter.py \
+  --domain example.com --state-file /var/lib/nagios4/certspotter/example.com.json \
+  --show-events
+```
+
+The API only returns unexpired issuances. Certificates that expire before the
+next poll, upstream omissions, and CT indexing delays remain monitoring limits.
+Six-hour polling can also delay detection by approximately six hours plus upstream
+indexing/scheduling time. See the [API reference](https://sslmate.com/help/reference/ct_search_api_v1).
+
+## Upgrading from 1.0.0
+
+1. Back up the state files while the checks are quiescent.
+2. Install the 1.1.0 plugin and preserve the existing token and state paths.
+3. Change the local check interval to 60 minutes and `is_volatile` to `0`.
+4. Set `notification_interval 0` and add the timing arguments to the command.
+5. Run tests and Nagios configuration preflight before reloading.
+
+The first upgraded run contacts the API because v1 has no polling timestamp;
+subsequent local runs respect the configured interval. Existing cursors do not
+reset. The new check emits last-attempt and last-success times on subsequent
+output lines so cached OK is not confused with a fresh API lookup.
 
 ## Testing
 

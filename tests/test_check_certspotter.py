@@ -115,7 +115,7 @@ class CertSpotterTests(unittest.TestCase):
         self.assertEqual(calls, domains)
         self.assertEqual(queries, 2)
         self.assertEqual(findings, [])
-        self.assertEqual(errors, [])
+        self.assertTrue(any("pagination incomplete" in error for error in errors))
 
     def test_same_issuance_across_domains_is_reported_once(self) -> None:
         domains = ["example.com", "example.net"]
