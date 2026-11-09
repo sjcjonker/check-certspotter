@@ -76,8 +76,7 @@ The defaults are:
 Use `--config`, `--state-file`, `--timeout`, `--max-queries`, `--poll-interval`
 and `--warning-duration` to override them. Time values are in seconds and must
 be finite and positive. The query budget must be at least the number of configured
-domains. There is no new token-file setting: the timing options are command-line
-arguments, making separate monitoring commands straightforward.
+domains. Timing options are command-line arguments, not token-file settings.
 
 ## Nagios configuration
 
@@ -145,10 +144,7 @@ State version 2 stores:
 - `events`: full issuance objects with domain, detection time and local output
   acknowledgement time. Events remain available after their WARNING expires.
 
-Existing version 1 state migrates automatically and keeps its cursors. Back up
-state before upgrading; version 1.0.0 cannot read version 2 state. To roll back,
-restore the old state backup with the old plugin. Events discovered after that
-backup may be replayed on a subsequent poll.
+See [Upgrading from 1.0.0](#upgrading-from-100) for migration and rollback.
 
 A missing state file or a new domain without state returns UNKNOWN. Restore a
 backup to preserve continuity, or run `--initialize` explicitly to build a new
@@ -189,8 +185,9 @@ indexing/scheduling time. See the [API reference](https://sslmate.com/help/refer
 5. Run tests and Nagios configuration preflight before reloading.
 
 The first upgraded run contacts the API because v1 has no polling timestamp;
-subsequent local runs respect the configured interval. Existing cursors do not
-reset. The new check emits last-attempt and last-success times on subsequent
+subsequent local runs respect the configured interval. State v1 migrates to v2
+without resetting cursors. Version 1.0.0 cannot read v2 state: restore the old
+plugin and its matching state backup to roll back. Later events may be replayed. The new check emits last-attempt and last-success times on subsequent
 output lines so cached OK is not confused with a fresh API lookup.
 
 ## Testing
@@ -201,6 +198,12 @@ The test suite performs no network calls:
 python3 -m py_compile check_certspotter.py
 python3 -m unittest discover -s tests -v
 ```
+
+CI runs one Python syntax check on code PRs to `main`, or on manual dispatch.
+Documentation-only PRs are skipped; pushes do not start duplicate runs. The full
+offline test suite above remains a local pre-release/code-change check. CI does
+not establish compatibility across Python versions. Releases are deliberate
+manual operations; commit messages do not publish them automatically.
 
 ## License
 

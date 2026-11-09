@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Monitor newly observed Certificate Transparency issuances for domains.
+# Author: Stijn Jonker (sjcjonker) | https://github.com/sjcjonker
+# Usage: python3 check_certspotter.py --domain example.com --initialize
+# Initialize deliberately; default poll: 6h, warning: 1h. Private token required. Help: --help.
+# Nagios exit codes: 0 OK, 1 WARNING, 2 CRITICAL, 3 UNKNOWN.
 
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Stijn Jonker

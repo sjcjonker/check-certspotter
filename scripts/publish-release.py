@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Publish the tested main commit as a GitHub release in CI.
+# Author: Stijn Jonker (sjcjonker) | https://github.com/sjcjonker
+# Usage: python3 scripts/publish-release.py (from the repository root in GitHub Actions)
+# Requires GITHUB_REF, GITHUB_REPOSITORY, GITHUB_SHA and GITHUB_TOKEN; no CLI options.
 """Publish the tested workflow commit using its scoped GitHub Actions token."""
 import ast
 import json
